@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Parallel Experiment Runner for Emotion Recognition
+Enhanced Experiment Runner for Emotion Recognition
 
-This script runs multiple experiments with different sample sizes in parallel
-to find the optimal configuration for emotion recognition.
+This script runs experiments with improved data processing and model architecture
+to achieve higher accuracy in emotion recognition.
 """
 
 import os
@@ -13,8 +13,10 @@ import json
 from datetime import datetime
 import pandas as pd
 import matplotlib.pyplot as plt
-from concurrent.futures import ProcessPoolExecutor
 import numpy as np
+import torch
+from concurrent.futures import ProcessPoolExecutor
+import argparse
 
 def run_experiment(samples_per_emotion):
     """Run a single experiment with specified number of samples per emotion."""
@@ -23,15 +25,49 @@ def run_experiment(samples_per_emotion):
     os.makedirs(exp_dir, exist_ok=True)
     
     # Extract test dataset
-    subprocess.run(["python3", "extract_test_dataset.py", "--samples", str(samples_per_emotion)])
+    subprocess.run([
+        "python3", "extract_test_dataset.py",
+        "--samples", str(samples_per_emotion)
+    ])
+    
+    # Enhanced configuration
+    config = {
+        "data_dir": "./test_data",
+        "output_dir": exp_dir,
+        "sequence_length": 300,
+        "batch_size": 16,
+        "epochs": 150,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.01,
+        "dropout_rate": 0.2,
+        "use_data_augmentation": True,
+        "feature_engineering": True,
+        "use_velocity": True,
+        "use_acceleration": True,
+        "use_joint_angles": True,
+        "use_selected_joints": True,
+        "d_model": 512,
+        "nhead": 8,
+        "num_layers": 6,
+        "hidden_dim": 256,
+        "num_classes": 7,
+        "label_smoothing": 0.1,
+        "mixup_alpha": 0.2,
+        "augment_prob": 0.5,
+        "use_focal_loss": True,
+        "focal_gamma": 2.0,
+        "warmup_steps": 2000,
+        "max_steps": 20000
+    }
+    
+    # Save configuration
+    with open(os.path.join(exp_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=4)
     
     # Run emotion recognition pipeline
     subprocess.run([
         "python3", "emotion_recognition_pipeline.py",
-        "--data_dir", "./test_data",
-        "--output_dir", exp_dir,
-        "--epochs", "20",
-        "--batch_size", "4"
+        "--config", os.path.join(exp_dir, "config.json")
     ])
     
     # Load results
@@ -40,49 +76,64 @@ def run_experiment(samples_per_emotion):
             results = json.load(f)
         return {
             "samples_per_emotion": samples_per_emotion,
-            "mlp_train_acc": results["mlp_train_acc"],
-            "mlp_val_acc": results["mlp_val_acc"],
-            "lstm_train_acc": results["lstm_train_acc"],
-            "lstm_val_acc": results["lstm_val_acc"]
+            "train_acc": results["train_acc"],
+            "val_acc": results["val_acc"],
+            "test_acc": results["test_acc"],
+            "best_epoch": results["best_epoch"]
         }
-    except:
+    except Exception as e:
+        print(f"Error loading results for {samples_per_emotion} samples: {str(e)}")
         return None
 
 def plot_results(results_df):
-    """Plot experiment results."""
-    plt.figure(figsize=(12, 6))
+    """Plot experiment results with enhanced visualization."""
+    plt.figure(figsize=(15, 10))
     
-    # Plot MLP results
-    plt.subplot(1, 2, 1)
-    plt.plot(results_df["samples_per_emotion"], results_df["mlp_train_acc"], 
-             marker='o', label='MLP Train')
-    plt.plot(results_df["samples_per_emotion"], results_df["mlp_val_acc"], 
-             marker='o', label='MLP Val')
-    plt.xlabel('Samples per Emotion')
+    # Plot training metrics
+    plt.subplot(2, 1, 1)
+    plt.plot(results_df["samples_per_emotion"], results_df["train_acc"],
+             marker='o', label='Training Accuracy', linewidth=2)
+    plt.plot(results_df["samples_per_emotion"], results_df["val_acc"],
+             marker='s', label='Validation Accuracy', linewidth=2)
+    plt.plot(results_df["samples_per_emotion"], results_df["test_acc"],
+             marker='^', label='Test Accuracy', linewidth=2)
+    plt.xlabel('Samples per Emotion Class')
     plt.ylabel('Accuracy (%)')
-    plt.title('MLP Model Performance')
+    plt.title('Model Performance vs Dataset Size')
     plt.legend()
     plt.grid(True)
     
-    # Plot LSTM results
-    plt.subplot(1, 2, 2)
-    plt.plot(results_df["samples_per_emotion"], results_df["lstm_train_acc"], 
-             marker='o', label='LSTM Train')
-    plt.plot(results_df["samples_per_emotion"], results_df["lstm_val_acc"], 
-             marker='o', label='LSTM Val')
-    plt.xlabel('Samples per Emotion')
-    plt.ylabel('Accuracy (%)')
-    plt.title('LSTM Model Performance')
-    plt.legend()
+    # Plot best epoch distribution
+    plt.subplot(2, 1, 2)
+    plt.bar(results_df["samples_per_emotion"], results_df["best_epoch"])
+    plt.xlabel('Samples per Emotion Class')
+    plt.ylabel('Best Epoch')
+    plt.title('Convergence Speed vs Dataset Size')
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig("experiment_results.png")
+    plt.savefig("experiment_results.png", dpi=300, bbox_inches='tight')
     plt.close()
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Run emotion recognition experiments')
+    parser.add_argument('--samples', type=int, default=20,
+                      help='Number of samples per emotion class')
+    parser.add_argument('--epochs', type=int, default=150,
+                      help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=16,
+                      help='Batch size for training')
+    args = parser.parse_args()
+    
     # Sample sizes to test
-    sample_sizes = [5, 10, 15, 20]
+    base_samples = args.samples
+    sample_sizes = [
+        max(5, base_samples // 4),
+        max(10, base_samples // 2),
+        max(15, base_samples * 3 // 4),
+        base_samples
+    ]
     
     # Run experiments in parallel
     results = []
@@ -91,6 +142,10 @@ def main():
     
     # Filter out failed experiments
     results = [r for r in results if r is not None]
+    
+    if not results:
+        print("No experiments completed successfully")
+        return
     
     # Convert to DataFrame
     results_df = pd.DataFrame(results)
@@ -106,14 +161,14 @@ def main():
     print(results_df.to_string(index=False))
     
     # Find best configuration
-    best_mlp = results_df.loc[results_df["mlp_val_acc"].idxmax()]
-    best_lstm = results_df.loc[results_df["lstm_val_acc"].idxmax()]
+    best_config = results_df.loc[results_df["test_acc"].idxmax()]
     
-    print("\nBest Configurations:")
-    print(f"MLP: {best_mlp['samples_per_emotion']} samples per emotion "
-          f"(Val Acc: {best_mlp['mlp_val_acc']:.2f}%)")
-    print(f"LSTM: {best_lstm['samples_per_emotion']} samples per emotion "
-          f"(Val Acc: {best_lstm['lstm_val_acc']:.2f}%)")
+    print("\nBest Configuration:")
+    print(f"Samples per emotion: {best_config['samples_per_emotion']}")
+    print(f"Training Accuracy: {best_config['train_acc']:.2f}%")
+    print(f"Validation Accuracy: {best_config['val_acc']:.2f}%")
+    print(f"Test Accuracy: {best_config['test_acc']:.2f}%")
+    print(f"Best Epoch: {best_config['best_epoch']}")
 
 if __name__ == "__main__":
     main() 

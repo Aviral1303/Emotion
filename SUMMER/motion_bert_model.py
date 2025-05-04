@@ -14,24 +14,55 @@ import math
 from typing import Dict, Tuple, Optional
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+    def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor, shape [batch_size, seq_len, embedding_dim]
-        """
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
+        return x + self.pe[:, :x.size(1)]
+
+class JointAttention(nn.Module):
+    def __init__(self, d_model: int, num_joints: int):
+        super().__init__()
+        self.joint_attention = nn.MultiheadAttention(d_model, 8, dropout=0.1)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Reshape to [num_joints, batch * seq_len, features]
+        batch_size, seq_len, num_joints, features = x.shape
+        x = x.transpose(1, 2).reshape(num_joints, batch_size * seq_len, features)
+        
+        # Apply self-attention across joints
+        attended, _ = self.joint_attention(x, x, x)
+        attended = self.dropout(attended)
+        x = self.norm(x + attended)
+        
+        # Reshape back
+        x = x.reshape(num_joints, batch_size, seq_len, features)
+        x = x.permute(1, 2, 0, 3)  # [batch, seq_len, num_joints, features]
+        return x
+
+class TemporalAttention(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.temporal_attention = nn.MultiheadAttention(d_model, 8, dropout=0.1)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: [batch, seq_len, num_joints * features]
+        x = x.transpose(0, 1)  # [seq_len, batch, features]
+        attended, _ = self.temporal_attention(x, x, x)
+        attended = self.dropout(attended)
+        x = self.norm(x + attended)
+        return x.transpose(0, 1)
 
 class MotionBERT(nn.Module):
     def __init__(self, config):
@@ -153,27 +184,104 @@ class MotionBERT(nn.Module):
 class MotionBERTClassifier(nn.Module):
     def __init__(self, config: Dict):
         super().__init__()
-        self.motion_bert = MotionBERT(config)
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.motion_bert(x)
+        self.d_model = config["d_model"]
+        self.num_joints = len(config["selected_joints"])
+        input_dim = self.num_joints * 3  # 3D position per joint
+        
+        if config["use_velocity"]:
+            input_dim += self.num_joints * 3
+        if config["use_acceleration"]:
+            input_dim += self.num_joints * 3
+        if config["use_joint_angles"]:
+            input_dim += 5  # Number of angle triplets
+            
+        # Input projection
+        self.input_projection = nn.Linear(input_dim, self.d_model)
+        self.pos_encoder = PositionalEncoding(self.d_model)
+        
+        # Joint attention
+        self.joint_attention = JointAttention(self.d_model, self.num_joints)
+        
+        # Temporal transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=config["nhead"],
+            dim_feedforward=config["hidden_dim"],
+            dropout=config["dropout_rate"],
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=config["num_layers"]
+        )
+        
+        # Temporal attention
+        self.temporal_attention = TemporalAttention(self.d_model)
+        
+        # Output layers
+        self.norm = nn.LayerNorm(self.d_model)
+        self.dropout = nn.Dropout(config["dropout_rate"])
+        
+        # Two-stage classification head
+        self.pre_classifier = nn.Sequential(
+            nn.Linear(self.d_model, config["hidden_dim"]),
+            nn.GELU(),
+            nn.Dropout(config["dropout_rate"]),
+            nn.Linear(config["hidden_dim"], config["hidden_dim"] // 2)
+        )
+        
+        self.classifier = nn.Linear(config["hidden_dim"] // 2, config["num_classes"])
+        
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Project input to d_model dimension
+        x = self.input_projection(x)
+        
+        # Add positional encoding
+        x = self.pos_encoder(x)
+        
+        # Reshape for joint attention
+        batch_size, seq_len, _ = x.shape
+        x = x.reshape(batch_size, seq_len, self.num_joints, -1)
+        
+        # Apply joint attention
+        x = self.joint_attention(x)
+        
+        # Reshape for temporal transformer
+        x = x.reshape(batch_size, seq_len, -1)
+        
+        # Apply temporal attention
+        x = self.temporal_attention(x)
+        
+        # Apply transformer encoder
+        if attention_mask is not None:
+            x = x.masked_fill(attention_mask.unsqueeze(-1), 0)
+        x = self.transformer_encoder(x)
+        
+        # Global average pooling
+        x = torch.mean(x, dim=1)
+        
+        # Classification head
+        x = self.norm(x)
+        x = self.dropout(x)
+        x = self.pre_classifier(x)
+        x = F.gelu(x)
+        x = self.classifier(x)
+        
+        return x
 
-def create_motion_bert_config(input_dim, num_classes):
-    """Create configuration for MotionBERT model with improved defaults."""
-    return {
-        "input_dim": input_dim,
-        "hidden_dim": 256,
-        "num_layers": 6,
-        "num_heads": 8,
-        "dropout_rate": 0.2,  # Increased dropout
-        "max_sequence_length": 200,
-        "num_classes": num_classes,
-        "learning_rate": 0.0001,  # Reduced learning rate
-        "weight_decay": 0.05,  # Increased weight decay
-        "warmup_steps": 1000,
-        "max_steps": 10000,
-        "gradient_clip_val": 1.0
-    }
+def create_motion_bert_config(base_config: Dict) -> Dict:
+    """Create MotionBERT specific configuration."""
+    config = base_config.copy()
+    
+    # Add model specific parameters
+    config.update({
+        "max_position_embeddings": config["sequence_length"],
+        "hidden_dropout_prob": config["dropout_rate"],
+        "attention_probs_dropout_prob": config["dropout_rate"]
+    })
+    
+    return config
 
 def train_motion_bert(model, train_loader, val_loader, config):
     """Train MotionBERT model with improved training strategy."""

@@ -28,6 +28,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import argparse
 import torch.nn.functional as F
+import json
 
 try:
     import bvh
@@ -51,6 +52,28 @@ EMOTION_MAP = {
     "Surprise": 6
 }
 
+# Important joints for emotion recognition
+IMPORTANT_JOINTS = [
+    "Hips",           # Root
+    "Spine",         # Core
+    "Spine1",
+    "Spine2",
+    "Neck",          # Upper body
+    "Head",
+    "LeftArm",       # Arms
+    "LeftForeArm",
+    "LeftHand",
+    "RightArm",
+    "RightForeArm",
+    "RightHand",
+    "LeftUpLeg",     # Legs
+    "LeftLeg",
+    "LeftFoot",
+    "RightUpLeg",
+    "RightLeg",
+    "RightFoot"
+]
+
 # Reverse mapping for readability
 EMOTION_LABELS = {v: k for k, v in EMOTION_MAP.items()}
 
@@ -58,22 +81,43 @@ EMOTION_LABELS = {v: k for k, v in EMOTION_MAP.items()}
 CONFIG = {
     "data_dir": "./test_data",
     "output_dir": "./output",
-    "sequence_length": 150,
-    "batch_size": 32,  # Increased batch size
-    "epochs": 100,  # Increased epochs
-    "learning_rate": 0.0005,
+    "sequence_length": 300,
+    "batch_size": 16,
+    "epochs": 150,
+    "learning_rate": 0.0001,
     "weight_decay": 0.01,
     "test_size": 0.2,
     "validation_size": 0.2,
     "use_class_weights": True,
     "feature_engineering": True,
     "seed": 42,
-    "dropout_rate": 0.1,
-    "early_stopping_patience": 15,  # Increased patience
+    "dropout_rate": 0.2,
+    "early_stopping_patience": 20,
     "use_data_augmentation": True,
-    "warmup_steps": 1000,
-    "max_steps": 10000,
-    "gradient_clip_val": 1.0
+    "warmup_steps": 2000,
+    "max_steps": 20000,
+    "gradient_clip_val": 1.0,
+    
+    # Feature extraction
+    "use_velocity": True,
+    "use_acceleration": True,
+    "use_joint_angles": True,
+    "use_selected_joints": True,
+    "selected_joints": IMPORTANT_JOINTS,
+    
+    # Model architecture
+    "d_model": 512,
+    "nhead": 8,
+    "num_layers": 6,
+    "hidden_dim": 256,
+    "num_classes": 7,
+    
+    # Training enhancements
+    "label_smoothing": 0.1,
+    "mixup_alpha": 0.2,
+    "augment_prob": 0.5,
+    "use_focal_loss": True,
+    "focal_gamma": 2.0
 }
 
 
@@ -674,46 +718,149 @@ def plot_training_history(history: Dict, config: Dict) -> None:
     plt.close()
 
 
-def augment_motion_data(motion_data: np.ndarray) -> np.ndarray:
+def extract_joint_angles(positions: np.ndarray, joint_triplets: List[Tuple[int, int, int]]) -> np.ndarray:
     """
-    Apply data augmentation to motion data.
+    Extract joint angles from position data.
     
     Args:
-        motion_data: Array of shape [sequence_length, features]
+        positions: Array of shape [timesteps, num_joints*3]
+        joint_triplets: List of (joint1, joint2, joint3) indices for angle calculation
         
     Returns:
-        Augmented motion data with same shape as input
+        Array of joint angles
     """
-    augmented = motion_data.copy()
+    timesteps = positions.shape[0]
+    num_angles = len(joint_triplets)
+    angles = np.zeros((timesteps, num_angles))
     
-    # Random noise
+    # Reshape positions to [timesteps, num_joints, 3]
+    pos_reshaped = positions.reshape(timesteps, -1, 3)
+    
+    for i, (j1, j2, j3) in enumerate(joint_triplets):
+        # Calculate vectors
+        v1 = pos_reshaped[:, j1] - pos_reshaped[:, j2]
+        v2 = pos_reshaped[:, j3] - pos_reshaped[:, j2]
+        
+        # Normalize vectors
+        v1_norm = np.linalg.norm(v1, axis=1, keepdims=True)
+        v2_norm = np.linalg.norm(v2, axis=1, keepdims=True)
+        v1_normalized = v1 / (v1_norm + 1e-7)
+        v2_normalized = v2 / (v2_norm + 1e-7)
+        
+        # Calculate angles
+        cos_angles = np.sum(v1_normalized * v2_normalized, axis=1)
+        angles[:, i] = np.arccos(np.clip(cos_angles, -1.0, 1.0))
+    
+    return angles
+
+
+def enhance_motion_features(motion_data: np.ndarray, config: Dict) -> np.ndarray:
+    """
+    Extract enhanced motion features including velocities, accelerations, and joint angles.
+    
+    Args:
+        motion_data: Array of shape [timesteps, num_joints*3]
+        config: Configuration dictionary
+        
+    Returns:
+        Enhanced feature array
+    """
+    features = [motion_data]  # Start with position data
+    
+    if config["use_velocity"]:
+        velocity = extract_velocity_features(motion_data)
+        features.append(velocity)
+    
+    if config["use_acceleration"]:
+        acceleration = extract_acceleration_features(motion_data)
+        features.append(acceleration)
+    
+    if config["use_joint_angles"]:
+        # Define important joint angle triplets
+        joint_triplets = [
+            (IMPORTANT_JOINTS.index("Spine"), IMPORTANT_JOINTS.index("Neck"), IMPORTANT_JOINTS.index("Head")),
+            (IMPORTANT_JOINTS.index("LeftArm"), IMPORTANT_JOINTS.index("LeftForeArm"), IMPORTANT_JOINTS.index("LeftHand")),
+            (IMPORTANT_JOINTS.index("RightArm"), IMPORTANT_JOINTS.index("RightForeArm"), IMPORTANT_JOINTS.index("RightHand")),
+            (IMPORTANT_JOINTS.index("LeftUpLeg"), IMPORTANT_JOINTS.index("LeftLeg"), IMPORTANT_JOINTS.index("LeftFoot")),
+            (IMPORTANT_JOINTS.index("RightUpLeg"), IMPORTANT_JOINTS.index("RightLeg"), IMPORTANT_JOINTS.index("RightFoot"))
+        ]
+        angles = extract_joint_angles(motion_data, joint_triplets)
+        features.append(angles)
+    
+    # Concatenate all features
+    enhanced_features = np.concatenate(features, axis=1)
+    
+    # Apply normalization
+    scaler = StandardScaler()
+    enhanced_features = scaler.fit_transform(enhanced_features)
+    
+    return enhanced_features
+
+
+def augment_motion_data(motion_data: np.ndarray, config: Dict) -> np.ndarray:
+    """
+    Apply various data augmentation techniques to motion data.
+    
+    Args:
+        motion_data: Array of shape [timesteps, features]
+        config: Configuration dictionary
+        
+    Returns:
+        Augmented motion data
+    """
+    if np.random.random() > config["augment_prob"]:
+        return motion_data
+    
+    augmented_data = motion_data.copy()
+    timesteps, num_features = augmented_data.shape
+    
+    # Random temporal scaling (speed variation)
     if np.random.random() < 0.5:
-        noise = np.random.normal(0, 0.01, augmented.shape)
-        augmented = augmented + noise
+        scale_factor = np.random.uniform(0.8, 1.2)
+        new_timesteps = int(timesteps * scale_factor)
+        new_timesteps = max(min(new_timesteps, int(timesteps * 1.2)), int(timesteps * 0.8))
+        
+        # Interpolate each feature independently
+        new_data = np.zeros((new_timesteps, num_features))
+        time_old = np.linspace(0, 1, timesteps)
+        time_new = np.linspace(0, 1, new_timesteps)
+        
+        for i in range(num_features):
+            new_data[:, i] = np.interp(time_new, time_old, augmented_data[:, i])
+        
+        augmented_data = new_data
     
     # Random rotation around vertical axis
     if np.random.random() < 0.5:
-        angle = np.random.uniform(-0.1, 0.1)
-        rotation_matrix = np.array([
-            [np.cos(angle), -np.sin(angle)],
-            [np.sin(angle), np.cos(angle)]
+        angle = np.random.uniform(-np.pi/6, np.pi/6)  # ±30 degrees
+        rot_matrix = np.array([
+            [np.cos(angle), 0, np.sin(angle)],
+            [0, 1, 0],
+            [-np.sin(angle), 0, np.cos(angle)]
         ])
-        # Apply rotation to x and y coordinates
-        for i in range(0, augmented.shape[1], 3):
-            if i + 1 < augmented.shape[1]:
-                coords = augmented[:, i:i+2]
-                rotated = np.dot(coords, rotation_matrix.T)
-                augmented[:, i:i+2] = rotated
+        
+        # Apply rotation to each joint position (assuming 3D coordinates)
+        num_joints = num_features // 3
+        positions = augmented_data.reshape(-1, num_joints, 3)
+        positions = np.einsum('ij,klj->kli', rot_matrix, positions)
+        augmented_data = positions.reshape(-1, num_features)
     
-    # Random time warping (disabled to maintain shape)
-    # if np.random.random() < 0.5:
-    #     scale = np.random.uniform(0.9, 1.1)
-    #     new_length = int(len(augmented) * scale)
-    #     indices = np.linspace(0, len(augmented)-1, new_length)
-    #     augmented = np.array([np.interp(indices, np.arange(len(augmented)), augmented[:, i]) 
-    #                          for i in range(augmented.shape[1])]).T
+    # Random noise addition
+    if np.random.random() < 0.3:
+        noise_level = np.random.uniform(0.01, 0.02)
+        noise = np.random.normal(0, noise_level, augmented_data.shape)
+        augmented_data += noise
     
-    return augmented
+    # Random joint masking
+    if np.random.random() < 0.3:
+        num_joints = num_features // 3
+        mask_size = np.random.randint(1, 4)  # Mask 1-3 joints
+        joint_indices = np.random.choice(num_joints, mask_size, replace=False)
+        for idx in joint_indices:
+            start_idx = idx * 3
+            augmented_data[:, start_idx:start_idx+3] = 0
+    
+    return augmented_data
 
 
 def create_balanced_subset(X: np.ndarray, y: np.ndarray, samples_per_class: int = 20) -> Tuple[np.ndarray, np.ndarray]:
@@ -746,78 +893,95 @@ def create_balanced_subset(X: np.ndarray, y: np.ndarray, samples_per_class: int 
 
 def process_dataset(data_dir: str, config: Dict) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """
-    Process the dataset with improved preprocessing for MotionBERT.
-    """
-    # Find BVH files directly in the data directory
-    bvh_files = glob.glob(os.path.join(data_dir, "*.bvh"))
+    Process the dataset and prepare it for training.
     
+    Args:
+        data_dir: Directory containing BVH files
+        config: Configuration dictionary
+        
+    Returns:
+        X: Motion features
+        y: Labels
+        metadata_df: DataFrame with metadata
+    """
+    # Get list of BVH files
+    bvh_files = glob.glob(os.path.join(data_dir, "*.bvh"))
     if not bvh_files:
         raise FileNotFoundError(f"No BVH files found in {data_dir}")
     
     print(f"Found {len(bvh_files)} BVH files")
     
     # Process each file
-    all_motion_data = []
-    all_labels = []
-    metadata_list = []
+    X = []
+    y = []
+    metadata = []
     
     for bvh_file in tqdm(bvh_files, desc="Processing BVH files"):
         try:
-            # Extract metadata from filename
-            metadata = parse_filename(bvh_file)
+            # Parse metadata from filename
+            file_metadata = parse_filename(bvh_file)
             
-            # Skip files with invalid emotion IDs
-            if metadata["emotion_id"] == -1:
-                print(f"Skipping {bvh_file} - Unknown emotion: {metadata['emotion']}")
+            # Extract motion data
+            motion_data = parse_bvh_file(bvh_file, config.get("selected_joints"))
+            
+            # Skip if motion data is invalid
+            if motion_data is None or len(motion_data) < 10:
                 continue
                 
-            # Parse BVH file
-            motion_data = parse_bvh_file(bvh_file)
+            # Enhance features
+            if config["feature_engineering"]:
+                motion_data = enhance_motion_features(motion_data, config)
             
-            # Enhanced normalization with velocity and acceleration
-            motion_data = normalize_motion_data(motion_data)
+            # Normalize sequence length
+            motion_data = tokenize_sequence_pooling(motion_data, config["sequence_length"])
             
-            # Motion-aware tokenization
-            tokenized_data = tokenize_sequence_pooling(motion_data, config["sequence_length"])
-            
-            # Append to lists
-            all_motion_data.append(tokenized_data)
-            all_labels.append(metadata["emotion_id"])
-            metadata_list.append(metadata)
+            X.append(motion_data)
+            y.append(file_metadata["emotion_id"])
+            metadata.append(file_metadata)
             
         except Exception as e:
-            print(f"Error processing {bvh_file}: {e}")
+            print(f"Error processing {bvh_file}: {str(e)}")
+            continue
     
-    # Convert lists to arrays
-    X = np.array(all_motion_data)
-    y = np.array(all_labels)
+    if not X:
+        raise ValueError("No valid motion data found in the dataset")
+    
+    # Convert to numpy arrays
+    X = np.array(X)
+    y = np.array(y)
     
     # Create metadata DataFrame
-    metadata_df = pd.DataFrame(metadata_list)
+    metadata_df = pd.DataFrame(metadata)
     
     # Print emotion distribution
-    unique_labels, counts = np.unique(y, return_counts=True)
     print("\nEmotion distribution:")
-    for label, count in zip(unique_labels, counts):
-        print(f"  {EMOTION_LABELS[label]}: {count} samples")
+    for emotion_id, count in zip(*np.unique(y, return_counts=True)):
+        print(f"  {EMOTION_LABELS[emotion_id]}: {count} samples")
     
-    # Apply data augmentation if enabled
+    # Data augmentation
     if config["use_data_augmentation"]:
+        print("\nApplying data augmentation...")
         augmented_data = []
         augmented_labels = []
         
-        for i in range(len(X)):
-            # Original data
-            augmented_data.append(X[i])
-            augmented_labels.append(y[i])
-            
-            # Augmented version
-            aug_data = augment_motion_data(X[i])
-            augmented_data.append(aug_data)
-            augmented_labels.append(y[i])
+        # Compute class weights for balanced augmentation
+        class_counts = np.bincount(y)
+        max_count = np.max(class_counts)
         
-        X = np.array(augmented_data)
-        y = np.array(augmented_labels)
+        for class_id in range(len(class_counts)):
+            class_indices = np.where(y == class_id)[0]
+            num_augment = max_count - class_counts[class_id]
+            
+            if num_augment > 0:
+                aug_indices = np.random.choice(class_indices, size=num_augment, replace=True)
+                for idx in aug_indices:
+                    aug_data = augment_motion_data(X[idx], config)
+                    augmented_data.append(aug_data)
+                    augmented_labels.append(class_id)
+        
+        if augmented_data:
+            X = np.concatenate([X, np.array(augmented_data)], axis=0)
+            y = np.concatenate([y, np.array(augmented_labels)])
     
     return X, y, metadata_df
 
@@ -855,126 +1019,144 @@ def extract_acceleration_features(positions: np.ndarray) -> np.ndarray:
     return acceleration
 
 
-def enhance_motion_features(motion_data: np.ndarray) -> np.ndarray:
-    """
-    Enhance motion data with derived features.
-    
-    Args:
-        motion_data: Array of shape [timesteps, num_joints*3]
-        
-    Returns:
-        Enhanced features with additional velocity and acceleration
-    """
-    velocity = extract_velocity_features(motion_data)
-    acceleration = extract_acceleration_features(motion_data)
-    
-    # Scale to balance magnitude differences
-    v_scale = 0.5
-    a_scale = 0.25
-    
-    # Concatenate features along feature dimension
-    enhanced = np.concatenate([
-        motion_data, 
-        velocity * v_scale, 
-        acceleration * a_scale
-    ], axis=1)
-    
-    return enhanced
-
-
 def main():
-    """Main function to run the entire pipeline."""
-    # Setup directories
-    os.makedirs(CONFIG["data_dir"], exist_ok=True)
-    os.makedirs(CONFIG["output_dir"], exist_ok=True)
+    """Main function to run the emotion recognition pipeline."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Run emotion recognition pipeline')
+    parser.add_argument('--config', type=str, help='Path to configuration file')
+    parser.add_argument('--data_dir', type=str, default='./test_data',
+                      help='Directory containing BVH files')
+    parser.add_argument('--output_dir', type=str, default='./output',
+                      help='Directory for output files')
+    parser.add_argument('--epochs', type=int, default=100,
+                      help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=32,
+                      help='Training batch size')
+    args = parser.parse_args()
     
-    if not os.path.exists(CONFIG["data_dir"]):
-        print(f"Data directory {CONFIG['data_dir']} not found.")
-        return
+    # Load configuration
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            config = json.load(f)
+            # Ensure all required parameters are present
+            for key, value in CONFIG.items():
+                if key not in config:
+                    config[key] = value
+    else:
+        # Use default configuration
+        config = CONFIG.copy()
+        config.update({
+            'data_dir': args.data_dir,
+            'output_dir': args.output_dir,
+            'epochs': args.epochs,
+            'batch_size': args.batch_size
+        })
     
-    print("Processing dataset...")
-    X, y, metadata_df = process_dataset(CONFIG["data_dir"], CONFIG)
+    # Create output directory
+    os.makedirs(config['output_dir'], exist_ok=True)
     
-    # Save processed data
-    print("Saving processed data...")
-    np.save(os.path.join(CONFIG["output_dir"], "X.npy"), X)
-    np.save(os.path.join(CONFIG["output_dir"], "y.npy"), y)
-    metadata_df.to_csv(os.path.join(CONFIG["output_dir"], "metadata.csv"), index=False)
+    # Set random seeds for reproducibility
+    torch.manual_seed(config['seed'])
+    np.random.seed(config['seed'])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config['seed'])
     
-    # Split data
+    # Process dataset
+    X, y, metadata_df = process_dataset(config['data_dir'], config)
+    
+    # Split dataset
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=CONFIG["test_size"], random_state=CONFIG["seed"], stratify=y
+        X, y, test_size=config['test_size'], 
+        stratify=y, random_state=config['seed']
     )
     
     X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train, test_size=CONFIG["validation_size"]/(1-CONFIG["test_size"]),
-        random_state=CONFIG["seed"], stratify=y_train
+        X_train, y_train, 
+        test_size=config['validation_size'],
+        stratify=y_train, 
+        random_state=config['seed']
     )
     
-    print(f"Training set: {X_train.shape[0]} samples")
-    print(f"Validation set: {X_val.shape[0]} samples")
-    print(f"Test set: {X_test.shape[0]} samples")
-    
-    # Create datasets and dataloaders
+    # Create data loaders
     train_dataset = EmotionMotionDataset(X_train, y_train)
     val_dataset = EmotionMotionDataset(X_val, y_val)
     test_dataset = EmotionMotionDataset(X_test, y_test)
     
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"])
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"])
-    
-    # Create MotionBERT model
-    print("Creating MotionBERT model...")
-    model_config = create_motion_bert_config(
-        input_dim=X_train.shape[2],  # features
-        num_classes=len(EMOTION_MAP)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=4
     )
     
-    # Update model config with training parameters
-    model_config.update({
-        "learning_rate": CONFIG["learning_rate"],
-        "weight_decay": CONFIG["weight_decay"],
-        "epochs": CONFIG["epochs"],
-        "early_stopping_patience": CONFIG["early_stopping_patience"],
-        "warmup_steps": CONFIG["warmup_steps"],
-        "max_steps": CONFIG["max_steps"],
-        "gradient_clip_val": CONFIG["gradient_clip_val"]
-    })
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4
+    )
     
-    model = MotionBERTClassifier(model_config)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        num_workers=4
+    )
+    
+    # Create model
+    model = MotionBERTClassifier(config)
+    
+    # Use GPU if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
     
     # Train model
-    print("Training MotionBERT model...")
-    model, history = train_motion_bert(model, train_loader, val_loader, model_config)
+    model, history = train_motion_bert(
+        model,
+        train_loader,
+        val_loader,
+        config
+    )
+    
+    # Evaluate on test set
+    model.eval()
+    test_correct = 0
+    test_total = 0
+    
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs.data, 1)
+            test_total += labels.size(0)
+            test_correct += (predicted == labels).sum().item()
+    
+    test_acc = 100 * test_correct / test_total
+    
+    # Save results
+    results = {
+        'train_acc': history['train_acc'][-1],
+        'val_acc': history['val_acc'][-1],
+        'test_acc': test_acc,
+        'best_epoch': history['best_epoch']
+    }
+    
+    with open(os.path.join(config['output_dir'], 'results.json'), 'w') as f:
+        json.dump(results, f)
     
     # Plot training history
-    plot_training_history(history, CONFIG)
+    plot_training_history(history, config)
     
     # Save model
-    torch.save(model.state_dict(), os.path.join(CONFIG["output_dir"], "motion_bert_model.pth"))
+    torch.save(model.state_dict(), os.path.join(config['output_dir'], 'model.pth'))
     
-    print("Done!")
+    print("\nTraining completed!")
+    print(f"Final Training Accuracy: {results['train_acc']:.2f}%")
+    print(f"Final Validation Accuracy: {results['val_acc']:.2f}%")
+    print(f"Test Accuracy: {results['test_acc']:.2f}%")
+    print(f"Best Epoch: {results['best_epoch']}")
 
 
 if __name__ == "__main__":
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Emotion Recognition from Motion Data Pipeline')
-    parser.add_argument('--data_dir', type=str, default='./test_data',
-                        help='Directory containing BVH files')
-    parser.add_argument('--output_dir', type=str, default='./output',
-                        help='Directory to save outputs')
-    parser.add_argument('--epochs', type=int, default=50,
-                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help='Batch size for training')
-    
-    args = parser.parse_args()
-    
-    # Update CONFIG with command line arguments
-    CONFIG["data_dir"] = args.data_dir
-    CONFIG["output_dir"] = args.output_dir
-    CONFIG["epochs"] = args.epochs
-    CONFIG["batch_size"] = args.batch_size
-    
     main() 
