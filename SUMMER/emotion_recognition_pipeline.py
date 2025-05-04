@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Emotion Recognition from Motion Data Pipeline
+Emotion Recognition from Motion Data Pipeline using MotionBERT
 
-This script implements a research pipeline for emotion recognition using motion capture data.
-The pipeline includes data loading, preprocessing, tokenization, model training, and evaluation.
+This script implements a research pipeline for emotion recognition using motion capture data
+with a MotionBERT-based model.
 
 Dataset: Kinematic Dataset of Actors Expressing Emotions
          https://physionet.org/content/kinematic-actors-emotions/1.0.0/
@@ -22,10 +22,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optimizer
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import argparse
+import torch.nn.functional as F
 
 try:
     import bvh
@@ -34,6 +36,8 @@ except ImportError:
     import subprocess
     subprocess.check_call(["pip", "install", "bvh"])
     import bvh
+
+from motion_bert_model import MotionBERTClassifier, create_motion_bert_config, train_motion_bert
 
 # Global configurations
 EMOTION_MAP = {
@@ -52,18 +56,24 @@ EMOTION_LABELS = {v: k for k, v in EMOTION_MAP.items()}
 
 # Default configuration
 CONFIG = {
-    "data_dir": "./data",
+    "data_dir": "./test_data",
     "output_dir": "./output",
-    "sequence_length": 100,  # Target length after tokenization
-    "embedding_dim": 64,     # Dimension for embeddings
-    "batch_size": 32,
-    "epochs": 20,            # Increased from 5 for better convergence
-    "learning_rate": 0.001,
+    "sequence_length": 150,
+    "batch_size": 32,  # Increased batch size
+    "epochs": 100,  # Increased epochs
+    "learning_rate": 0.0005,
+    "weight_decay": 0.01,
     "test_size": 0.2,
-    "validation_size": 0.1,
-    "use_class_weights": True,  # Use class weights for imbalanced data
-    "feature_engineering": True, # Add velocity features
-    "seed": 42
+    "validation_size": 0.2,
+    "use_class_weights": True,
+    "feature_engineering": True,
+    "seed": 42,
+    "dropout_rate": 0.1,
+    "early_stopping_patience": 15,  # Increased patience
+    "use_data_augmentation": True,
+    "warmup_steps": 1000,
+    "max_steps": 10000,
+    "gradient_clip_val": 1.0
 }
 
 
@@ -179,34 +189,52 @@ def parse_bvh_file(filepath: str, selected_joints: Optional[List[str]] = None) -
 
 def normalize_motion_data(motion_data: np.ndarray) -> np.ndarray:
     """
-    Normalize motion data by centering and scaling.
+    Normalize motion data with improved preprocessing for MotionBERT.
     
     Args:
         motion_data: Array of shape [timesteps, features]
         
     Returns:
-        Normalized motion data
+        Normalized motion data with enhanced features
     """
-    # Center the root joint position at each timestep
-    # Assuming first 3 values are root joint x,y,z
+    # Extract root joint positions (first 3 values)
     root_positions = motion_data[:, :3]
-    centered_data = motion_data.copy()
     
-    # For each timestep, subtract root position from all joint positions
+    # Create root-relative coordinates
+    centered_data = motion_data.copy()
     for i in range(0, motion_data.shape[1], 3):
         centered_data[:, i:i+3] -= root_positions
     
-    # Global scaling to normalize the overall magnitude
-    max_abs_val = np.max(np.abs(centered_data))
-    if max_abs_val > 0:
-        centered_data /= max_abs_val
+    # Calculate velocity and acceleration
+    velocity = np.zeros_like(centered_data)
+    velocity[1:] = centered_data[1:] - centered_data[:-1]
     
-    return centered_data
+    acceleration = np.zeros_like(velocity)
+    acceleration[1:] = velocity[1:] - velocity[:-1]
+    
+    # Scale features to similar ranges
+    pos_scale = 1.0
+    vel_scale = 0.5
+    acc_scale = 0.25
+    
+    # Combine features with appropriate scaling
+    enhanced_data = np.concatenate([
+        centered_data * pos_scale,
+        velocity * vel_scale,
+        acceleration * acc_scale
+    ], axis=1)
+    
+    # Global normalization
+    max_abs_val = np.max(np.abs(enhanced_data))
+    if max_abs_val > 0:
+        enhanced_data /= max_abs_val
+    
+    return enhanced_data
 
 
 def tokenize_sequence_pooling(motion_data: np.ndarray, target_length: int) -> np.ndarray:
     """
-    Tokenize a motion sequence using average pooling to achieve fixed length.
+    Improved sequence tokenization with motion-aware pooling.
     
     Args:
         motion_data: Array of shape [original_timesteps, features]
@@ -224,21 +252,26 @@ def tokenize_sequence_pooling(motion_data: np.ndarray, target_length: int) -> np
     # Initialize output array
     tokenized = np.zeros((target_length, features))
     
-    # For each target frame, compute the average of corresponding original frames
+    # Calculate motion energy for each frame
+    motion_energy = np.sum(np.abs(motion_data), axis=1)
+    max_energy = np.max(motion_energy)
+    if max_energy > 0:
+        motion_energy = motion_energy / max_energy
+    else:
+        motion_energy = np.ones_like(motion_energy) / original_length
+    
+    # Adaptive pooling based on motion energy
     for i in range(target_length):
         start_idx = int(i * original_length / target_length)
         end_idx = int((i + 1) * original_length / target_length)
         
-        # Handle edge case for the last segment
-        if end_idx > original_length:
-            end_idx = original_length
-            
         if start_idx == end_idx:
-            # If only one frame maps to this segment, use it directly
             tokenized[i] = motion_data[start_idx]
         else:
-            # Otherwise, take the average of all frames in the segment
-            tokenized[i] = np.mean(motion_data[start_idx:end_idx], axis=0)
+            # Weight frames by motion energy
+            weights = motion_energy[start_idx:end_idx]
+            weights = weights / (np.sum(weights) + 1e-8)  # Add small epsilon to avoid division by zero
+            tokenized[i] = np.average(motion_data[start_idx:end_idx], weights=weights, axis=0)
     
     return tokenized
 
@@ -285,6 +318,10 @@ class EmotionMotionDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.X[idx], self.y[idx]
+    
+    def get_labels(self) -> np.ndarray:
+        """Get all labels as numpy array."""
+        return self.y.numpy()
 
 
 class MLPClassifier(nn.Module):
@@ -321,34 +358,97 @@ class MLPClassifier(nn.Module):
         return x
 
 
-class LSTMClassifier(nn.Module):
+class EnhancedLSTMClassifier(nn.Module):
     """
-    LSTM-based classifier for emotion recognition.
+    Enhanced LSTM classifier with attention, residual connections, and layer normalization.
     """
-    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, num_classes: int):
-        """
-        Initialize the LSTM classifier.
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, num_classes: int, config: Dict):
+        super(EnhancedLSTMClassifier, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         
-        Args:
-            input_dim: Dimension of input features per timestep
-            hidden_dim: Dimension of LSTM hidden state
-            num_layers: Number of LSTM layers
-            num_classes: Number of emotion classes
-        """
-        super(LSTMClassifier, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, num_classes)
-        self.dropout = nn.Dropout(0.3)
+        # Input projection with layer normalization
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config["dropout_rate"])
+        )
+        
+        # Bidirectional LSTM with residual connections
+        self.lstm = nn.LSTM(
+            hidden_dim, 
+            hidden_dim, 
+            num_layers=num_layers, 
+            batch_first=True,
+            bidirectional=True,
+            dropout=config["dropout_rate"] if num_layers > 1 else 0
+        )
+        
+        # Layer normalization for LSTM output
+        self.lstm_norm = nn.LayerNorm(hidden_dim * 2)
+        
+        # Multi-head attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim * 2,
+            num_heads=4,
+            dropout=config["dropout_rate"],
+            batch_first=True
+        )
+        
+        # Layer normalization for attention output
+        self.attention_norm = nn.LayerNorm(hidden_dim * 2)
+        
+        # Residual blocks
+        self.residual_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim * 2),
+                nn.LayerNorm(hidden_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(config["dropout_rate"]),
+                nn.Linear(hidden_dim * 2, hidden_dim * 2),
+                nn.LayerNorm(hidden_dim * 2)
+            ) for _ in range(2)
+        ])
+        
+        # Classification layers
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config["dropout_rate"]),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(config["dropout_rate"]),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass."""
-        # x shape: [batch_size, sequence_length, input_dim]
-        output, _ = self.lstm(x)
-        # Use only the last time step output
-        output = output[:, -1, :]
-        output = self.dropout(output)
-        output = self.fc(output)
-        return output
+        batch_size = x.size(0)
+        
+        # Input projection
+        x = self.input_proj(x.view(-1, x.size(-1))).view(batch_size, -1, self.hidden_dim)
+        
+        # LSTM forward pass
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.lstm_norm(lstm_out)
+        
+        # Multi-head attention
+        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
+        attn_out = self.attention_norm(attn_out)
+        
+        # Global context with skip connection
+        context = torch.mean(attn_out + lstm_out, dim=1)
+        
+        # Residual connections
+        for residual_block in self.residual_blocks:
+            residual = residual_block(context)
+            context = F.relu(context + residual)
+        
+        # Classification
+        out = self.classifier(context)
+        return out
 
 
 class TransformerClassifier(nn.Module):
@@ -385,17 +485,18 @@ class TransformerClassifier(nn.Module):
         return x
 
 
-def calculate_class_weights(y: np.ndarray) -> torch.Tensor:
+def calculate_class_weights(dataset: EmotionMotionDataset) -> torch.Tensor:
     """
     Calculate weights inversely proportional to class frequencies.
     
     Args:
-        y: Array of class labels
+        dataset: EmotionMotionDataset instance
         
     Returns:
         Tensor of class weights for balanced training
     """
-    num_classes = max(len(EMOTION_LABELS), 7)  # Ensure at least 7 classes
+    y = dataset.get_labels()
+    num_classes = len(EMOTION_MAP)  # Use exact number of classes from EMOTION_MAP
     
     # Initialize weights with ones
     weights = np.ones(num_classes)
@@ -418,121 +519,124 @@ def calculate_class_weights(y: np.ndarray) -> torch.Tensor:
     return torch.FloatTensor(weights)
 
 
-def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, 
-                config: Dict) -> Tuple[nn.Module, Dict]:
-    """
-    Train an emotion recognition model.
-    
-    Args:
-        model: PyTorch model to train
-        train_loader: DataLoader for training data
-        val_loader: DataLoader for validation data
-        config: Configuration dictionary
-        
-    Returns:
-        Trained model and training history
-    """
+def train_motion_bert(model: nn.Module, 
+                     train_loader: torch.utils.data.DataLoader,
+                     val_loader: torch.utils.data.DataLoader,
+                     config: Dict) -> Tuple[nn.Module, Dict]:
+    """Train MotionBERT model with enhanced training strategy."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
-    # Get labels from train_loader for class weights calculation
-    train_labels = train_loader.dataset.y.numpy()
+    # Loss function with label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    # Use class weights if enabled
-    if config.get("use_class_weights", False):
-        class_weights = calculate_class_weights(train_labels).to(device)
-        print(f"Using class weights: {class_weights}")
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-    else:
-        criterion = nn.CrossEntropyLoss()
-    
-    optim = optimizer.Adam(model.parameters(), lr=config["learning_rate"])
-    
-    # Add learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim, mode='max', factor=0.5, patience=3
+    # Optimizer with weight decay
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+        betas=(0.9, 0.999)
     )
     
+    # Learning rate scheduler with warmup
+    num_training_steps = len(train_loader) * config["epochs"]
+    num_warmup_steps = config["warmup_steps"]
+    
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return max(
+            0.0,
+            float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
+        )
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # Training history
     history = {
-        "train_loss": [],
-        "train_acc": [],
-        "val_loss": [],
-        "val_acc": []
+        'train_loss': [],
+        'val_loss': [],
+        'train_acc': [],
+        'val_acc': []
     }
     
-    best_val_acc = 0.0
+    best_val_acc = 0
+    best_model = None
+    patience_counter = 0
     
     for epoch in range(config["epochs"]):
-        # Training
+        # Training phase
         model.train()
-        train_loss = 0.0
+        train_loss = 0
         train_correct = 0
         train_total = 0
         
-        for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']} [Train]"):
-            inputs, labels = inputs.to(device), labels.to(device)
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             
-            # Zero the parameter gradients
-            optim.zero_grad()
-            
-            # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            
-            # Backward pass and optimize
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
             loss.backward()
-            optim.step()
             
-            # Statistics
-            train_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config["gradient_clip_val"])
+            
+            optimizer.step()
+            scheduler.step()
+            
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_total += batch_y.size(0)
+            train_correct += predicted.eq(batch_y).sum().item()
         
-        train_loss = train_loss / train_total
-        train_acc = train_correct / train_total
+        train_loss = train_loss / len(train_loader)
+        train_acc = 100. * train_correct / train_total
         
-        # Validation
+        # Validation phase
         model.eval()
-        val_loss = 0.0
+        val_loss = 0
         val_correct = 0
         val_total = 0
         
         with torch.no_grad():
-            for inputs, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config['epochs']} [Val]"):
-                inputs, labels = inputs.to(device), labels.to(device)
+            for batch_x, batch_y in val_loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
                 
-                # Forward pass
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                
-                # Statistics
-                val_loss += loss.item() * inputs.size(0)
-                _, predicted = torch.max(outputs, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_total += batch_y.size(0)
+                val_correct += predicted.eq(batch_y).sum().item()
         
-        val_loss = val_loss / val_total
-        val_acc = val_correct / val_total
-        
-        # Update learning rate based on validation accuracy
-        scheduler.step(val_acc)
+        val_loss = val_loss / len(val_loader)
+        val_acc = 100. * val_correct / val_total
         
         # Update history
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
         
-        print(f"Epoch {epoch+1}/{config['epochs']} - "
-              f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
-              f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f'Epoch {epoch+1}: '
+              f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
+              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
         
-        # Save best model
+        # Early stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), os.path.join(config["output_dir"], "best_model.pt"))
-            print(f"New best validation accuracy: {val_acc:.4f} - Model saved")
+            best_model = model.state_dict().copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= config["early_stopping_patience"]:
+                print(f"Early stopping triggered after {epoch + 1} epochs")
+                break
+    
+    # Load best model
+    if best_model is not None:
+        model.load_state_dict(best_model)
     
     return model, history
 
@@ -570,18 +674,81 @@ def plot_training_history(history: Dict, config: Dict) -> None:
     plt.close()
 
 
-def process_dataset(data_dir: str, config: Dict) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+def augment_motion_data(motion_data: np.ndarray) -> np.ndarray:
     """
-    Process the entire dataset.
+    Apply data augmentation to motion data.
     
     Args:
-        data_dir: Directory containing BVH files
-        config: Configuration dictionary
+        motion_data: Array of shape [sequence_length, features]
         
     Returns:
-        Tokenized motion data, emotion labels, and metadata
+        Augmented motion data with same shape as input
     """
-    # Find all BVH files
+    augmented = motion_data.copy()
+    
+    # Random noise
+    if np.random.random() < 0.5:
+        noise = np.random.normal(0, 0.01, augmented.shape)
+        augmented = augmented + noise
+    
+    # Random rotation around vertical axis
+    if np.random.random() < 0.5:
+        angle = np.random.uniform(-0.1, 0.1)
+        rotation_matrix = np.array([
+            [np.cos(angle), -np.sin(angle)],
+            [np.sin(angle), np.cos(angle)]
+        ])
+        # Apply rotation to x and y coordinates
+        for i in range(0, augmented.shape[1], 3):
+            if i + 1 < augmented.shape[1]:
+                coords = augmented[:, i:i+2]
+                rotated = np.dot(coords, rotation_matrix.T)
+                augmented[:, i:i+2] = rotated
+    
+    # Random time warping (disabled to maintain shape)
+    # if np.random.random() < 0.5:
+    #     scale = np.random.uniform(0.9, 1.1)
+    #     new_length = int(len(augmented) * scale)
+    #     indices = np.linspace(0, len(augmented)-1, new_length)
+    #     augmented = np.array([np.interp(indices, np.arange(len(augmented)), augmented[:, i]) 
+    #                          for i in range(augmented.shape[1])]).T
+    
+    return augmented
+
+
+def create_balanced_subset(X: np.ndarray, y: np.ndarray, samples_per_class: int = 20) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Create a balanced subset of the dataset with specified number of samples per class.
+    
+    Args:
+        X: Input features array
+        y: Labels array
+        samples_per_class: Number of samples to select per class
+        
+    Returns:
+        Tuple of (X_subset, y_subset)
+    """
+    X_subset = []
+    y_subset = []
+    
+    for class_label in np.unique(y):
+        # Get indices for current class
+        class_indices = np.where(y == class_label)[0]
+        
+        # Randomly select samples_per_class samples
+        selected_indices = np.random.choice(class_indices, size=min(samples_per_class, len(class_indices)), replace=False)
+        
+        X_subset.extend(X[selected_indices])
+        y_subset.extend(y[selected_indices])
+    
+    return np.array(X_subset), np.array(y_subset)
+
+
+def process_dataset(data_dir: str, config: Dict) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """
+    Process the dataset with improved preprocessing for MotionBERT.
+    """
+    # Find BVH files directly in the data directory
     bvh_files = glob.glob(os.path.join(data_dir, "*.bvh"))
     
     if not bvh_files:
@@ -607,14 +774,10 @@ def process_dataset(data_dir: str, config: Dict) -> Tuple[np.ndarray, np.ndarray
             # Parse BVH file
             motion_data = parse_bvh_file(bvh_file)
             
-            # Normalize motion data
+            # Enhanced normalization with velocity and acceleration
             motion_data = normalize_motion_data(motion_data)
             
-            # Apply feature engineering if enabled
-            if config.get("feature_engineering", False):
-                motion_data = enhance_motion_features(motion_data)
-            
-            # Tokenize sequence
+            # Motion-aware tokenization
             tokenized_data = tokenize_sequence_pooling(motion_data, config["sequence_length"])
             
             # Append to lists
@@ -634,9 +797,27 @@ def process_dataset(data_dir: str, config: Dict) -> Tuple[np.ndarray, np.ndarray
     
     # Print emotion distribution
     unique_labels, counts = np.unique(y, return_counts=True)
-    print("Emotion distribution:")
+    print("\nEmotion distribution:")
     for label, count in zip(unique_labels, counts):
         print(f"  {EMOTION_LABELS[label]}: {count} samples")
+    
+    # Apply data augmentation if enabled
+    if config["use_data_augmentation"]:
+        augmented_data = []
+        augmented_labels = []
+        
+        for i in range(len(X)):
+            # Original data
+            augmented_data.append(X[i])
+            augmented_labels.append(y[i])
+            
+            # Augmented version
+            aug_data = augment_motion_data(X[i])
+            augmented_data.append(aug_data)
+            augmented_labels.append(y[i])
+        
+        X = np.array(augmented_data)
+        y = np.array(augmented_labels)
     
     return X, y, metadata_df
 
@@ -704,25 +885,15 @@ def enhance_motion_features(motion_data: np.ndarray) -> np.ndarray:
 def main():
     """Main function to run the entire pipeline."""
     # Setup directories
-    setup_directories(CONFIG)
+    os.makedirs(CONFIG["data_dir"], exist_ok=True)
+    os.makedirs(CONFIG["output_dir"], exist_ok=True)
     
-    # Check if data dir exists
     if not os.path.exists(CONFIG["data_dir"]):
-        print(f"Data directory {CONFIG['data_dir']} not found. Please download the dataset and extract it to this directory.")
-        print("Dataset URL: https://physionet.org/content/kinematic-actors-emotions/1.0.0/")
+        print(f"Data directory {CONFIG['data_dir']} not found.")
         return
     
-    # Process dataset
     print("Processing dataset...")
     X, y, metadata_df = process_dataset(CONFIG["data_dir"], CONFIG)
-    
-    # Determine the number of samples
-    n_samples = len(y)
-    
-    # Disable class weights for very small datasets (less than 50 samples)
-    if n_samples < 50 and CONFIG.get("use_class_weights", False):
-        print("Warning: Dataset too small (<50 samples). Disabling class weights.")
-        CONFIG["use_class_weights"] = False
     
     # Save processed data
     print("Saving processed data...")
@@ -730,42 +901,15 @@ def main():
     np.save(os.path.join(CONFIG["output_dir"], "y.npy"), y)
     metadata_df.to_csv(os.path.join(CONFIG["output_dir"], "metadata.csv"), index=False)
     
-    # Split data based on dataset size and class distribution
-    unique_labels, counts = np.unique(y, return_counts=True)
-    n_classes = len(unique_labels)
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=CONFIG["test_size"], random_state=CONFIG["seed"], stratify=y
+    )
     
-    # Check if dataset is too small for stratification
-    min_test_size = n_classes  # Need at least one sample per class
-    actual_test_size = int(n_samples * CONFIG["test_size"])
-    
-    if min_test_size > actual_test_size or np.min(counts) < 2:
-        print("Warning: Dataset too small for stratified sampling. Using random split.")
-        # For very small datasets, use simple random split
-        test_size = max(0.2, min_test_size / n_samples)
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=CONFIG["seed"]
-        )
-        
-        # If there are enough samples, create validation set
-        if len(X_train) > 2 * n_classes:
-            val_size = CONFIG["validation_size"] / (1 - test_size)
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_train, y_train, test_size=val_size, random_state=CONFIG["seed"]
-            )
-        else:
-            # For extremely small datasets, use test set as validation
-            print("Warning: Training set too small for separate validation. Using test set for validation.")
-            X_val, y_val = X_test, y_test
-    else:
-        # Normal case: enough data for stratified sampling
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=CONFIG["test_size"], random_state=CONFIG["seed"], stratify=y
-        )
-        
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_train, y_train, test_size=CONFIG["validation_size"]/(1-CONFIG["test_size"]),
-            random_state=CONFIG["seed"], stratify=y_train
-        )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=CONFIG["validation_size"]/(1-CONFIG["test_size"]),
+        random_state=CONFIG["seed"], stratify=y_train
+    )
     
     print(f"Training set: {X_train.shape[0]} samples")
     print(f"Validation set: {X_val.shape[0]} samples")
@@ -780,27 +924,35 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"])
     test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"])
     
-    # Create and train models
-    print("Training MLP model...")
-    input_dim = X_train.shape[1] * X_train.shape[2]  # sequence_length * features
-    num_classes = len(EMOTION_MAP)  # Get actual number of classes from EMOTION_MAP
-    
-    print(f"Input dimension: {input_dim}, Number of classes: {num_classes}")
-    
-    mlp_model = MLPClassifier(input_dim=input_dim, hidden_dim=256, num_classes=num_classes)
-    mlp_model, mlp_history = train_model(mlp_model, train_loader, val_loader, CONFIG)
-    
-    # Plot training history
-    plot_training_history(mlp_history, CONFIG)
-    
-    print("Training LSTM model...")
-    lstm_model = LSTMClassifier(
+    # Create MotionBERT model
+    print("Creating MotionBERT model...")
+    model_config = create_motion_bert_config(
         input_dim=X_train.shape[2],  # features
-        hidden_dim=128,
-        num_layers=2,
         num_classes=len(EMOTION_MAP)
     )
-    lstm_model, lstm_history = train_model(lstm_model, train_loader, val_loader, CONFIG)
+    
+    # Update model config with training parameters
+    model_config.update({
+        "learning_rate": CONFIG["learning_rate"],
+        "weight_decay": CONFIG["weight_decay"],
+        "epochs": CONFIG["epochs"],
+        "early_stopping_patience": CONFIG["early_stopping_patience"],
+        "warmup_steps": CONFIG["warmup_steps"],
+        "max_steps": CONFIG["max_steps"],
+        "gradient_clip_val": CONFIG["gradient_clip_val"]
+    })
+    
+    model = MotionBERTClassifier(model_config)
+    
+    # Train model
+    print("Training MotionBERT model...")
+    model, history = train_motion_bert(model, train_loader, val_loader, model_config)
+    
+    # Plot training history
+    plot_training_history(history, CONFIG)
+    
+    # Save model
+    torch.save(model.state_dict(), os.path.join(CONFIG["output_dir"], "motion_bert_model.pth"))
     
     print("Done!")
 
@@ -808,13 +960,13 @@ def main():
 if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Emotion Recognition from Motion Data Pipeline')
-    parser.add_argument('--data_dir', type=str, default='./data',
+    parser.add_argument('--data_dir', type=str, default='./test_data',
                         help='Directory containing BVH files')
     parser.add_argument('--output_dir', type=str, default='./output',
                         help='Directory to save outputs')
-    parser.add_argument('--epochs', type=int, default=20,
+    parser.add_argument('--epochs', type=int, default=50,
                         help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=16,
                         help='Batch size for training')
     
     args = parser.parse_args()

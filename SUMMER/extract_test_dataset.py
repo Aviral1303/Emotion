@@ -3,7 +3,7 @@
 """
 Test Dataset Extraction Utility
 
-This script extracts a small subset of BVH files from the Kinematic Dataset of Actors Expressing Emotions
+This script extracts a subset of BVH files from the Kinematic Dataset of Actors Expressing Emotions
 to a test data directory for validating the emotion recognition pipeline.
 """
 
@@ -12,20 +12,27 @@ import shutil
 import glob
 from tqdm import tqdm
 import random
+import argparse
 
 # Source and destination directories
-SOURCE_DIR = './kinematic-dataset-of-actors-expressing-emotions-2.1.0/BVH'
+SOURCE_DIR = './data/BVH'
 DEST_DIR = './test_data'
 
-# Number of files to sample per emotion
-SAMPLES_PER_EMOTION = 3
-
-def extract_test_bvh_files():
+def extract_test_bvh_files(samples_per_emotion):
     """
-    Extract a small subset of BVH files for testing.
+    Extract a subset of BVH files for testing.
+    
+    Args:
+        samples_per_emotion: Number of samples to extract per emotion class
     """
     # Create destination directory if it doesn't exist
     os.makedirs(DEST_DIR, exist_ok=True)
+    
+    # Clean existing files
+    for file in os.listdir(DEST_DIR):
+        file_path = os.path.join(DEST_DIR, file)
+        if os.path.isfile(file_path):
+            os.remove(file_path)
     
     # Get list of all actor directories
     actor_dirs = [d for d in os.listdir(SOURCE_DIR) 
@@ -65,7 +72,7 @@ def extract_test_bvh_files():
     for emotion, files in emotion_files.items():
         if files:
             # Take a random sample of files for this emotion
-            sample_size = min(SAMPLES_PER_EMOTION, len(files))
+            sample_size = min(samples_per_emotion, len(files))
             selected = random.sample(files, sample_size)
             selected_files.extend(selected)
             print(f"Selected {sample_size} files for emotion {emotion}")
@@ -110,4 +117,11 @@ def extract_test_bvh_files():
 if __name__ == "__main__":
     # Set seed for reproducibility
     random.seed(42)
-    extract_test_bvh_files() 
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Extract test dataset with specified samples per emotion')
+    parser.add_argument('--samples', type=int, default=3,
+                      help='Number of samples per emotion class')
+    args = parser.parse_args()
+    
+    extract_test_bvh_files(args.samples) 
