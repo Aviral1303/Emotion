@@ -324,6 +324,26 @@ class EmotionMotionDataset(Dataset):
         return self.y.numpy()
 
 
+def create_data_loaders(X, y, batch_size, val_size=0.2, random_state=42):
+    """
+    Split data into train/val sets and return DataLoaders.
+    """
+    # Convert labels to long tensor
+    y = torch.LongTensor(y)
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=val_size, random_state=random_state, stratify=y
+    )
+    
+    train_dataset = EmotionMotionDataset(X_train, y_train)
+    val_dataset = EmotionMotionDataset(X_val, y_val)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, val_loader
+
+
 class MLPClassifier(nn.Module):
     """
     Simple MLP classifier for emotion recognition.
@@ -882,99 +902,61 @@ def enhance_motion_features(motion_data: np.ndarray) -> np.ndarray:
     return enhanced
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train MotionBERT model for emotion recognition')
+    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing BVH files')
+    parser.add_argument('--output_dir', type=str, required=True, help='Directory to save model outputs')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+    parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate for training')
+    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay for regularization')
+    return parser.parse_args()
+
+
 def main():
-    """Main function to run the entire pipeline."""
-    # Setup directories
-    os.makedirs(CONFIG["data_dir"], exist_ok=True)
-    os.makedirs(CONFIG["output_dir"], exist_ok=True)
+    args = parse_args()
     
-    if not os.path.exists(CONFIG["data_dir"]):
-        print(f"Data directory {CONFIG['data_dir']} not found.")
-        return
-    
-    print("Processing dataset...")
-    X, y, metadata_df = process_dataset(CONFIG["data_dir"], CONFIG)
-    
-    # Save processed data
-    print("Saving processed data...")
-    np.save(os.path.join(CONFIG["output_dir"], "X.npy"), X)
-    np.save(os.path.join(CONFIG["output_dir"], "y.npy"), y)
-    metadata_df.to_csv(os.path.join(CONFIG["output_dir"], "metadata.csv"), index=False)
-    
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=CONFIG["test_size"], random_state=CONFIG["seed"], stratify=y
-    )
-    
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train, test_size=CONFIG["validation_size"]/(1-CONFIG["test_size"]),
-        random_state=CONFIG["seed"], stratify=y_train
-    )
-    
-    print(f"Training set: {X_train.shape[0]} samples")
-    print(f"Validation set: {X_val.shape[0]} samples")
-    print(f"Test set: {X_test.shape[0]} samples")
-    
-    # Create datasets and dataloaders
-    train_dataset = EmotionMotionDataset(X_train, y_train)
-    val_dataset = EmotionMotionDataset(X_val, y_val)
-    test_dataset = EmotionMotionDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"])
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"])
-    
-    # Create MotionBERT model
-    print("Creating MotionBERT model...")
-    model_config = create_motion_bert_config(
-        input_dim=X_train.shape[2],  # features
-        num_classes=len(EMOTION_MAP)
-    )
-    
-    # Update model config with training parameters
-    model_config.update({
-        "learning_rate": CONFIG["learning_rate"],
-        "weight_decay": CONFIG["weight_decay"],
-        "epochs": CONFIG["epochs"],
-        "early_stopping_patience": CONFIG["early_stopping_patience"],
-        "warmup_steps": CONFIG["warmup_steps"],
-        "max_steps": CONFIG["max_steps"],
-        "gradient_clip_val": CONFIG["gradient_clip_val"]
+    # Start with the full default config
+    config = CONFIG.copy()
+    config.update({
+        "data_dir": args.data_dir,
+        "output_dir": args.output_dir,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "sequence_length": 150,
+        "use_data_augmentation": True,
+        "warmup_steps": 1000,
+        "max_steps": 10000,
+        "gradient_clip_val": 1.0,
+        "early_stopping_patience": 15,
+        "dropout_rate": 0.3
     })
     
-    model = MotionBERTClassifier(model_config)
+    # Process dataset
+    print("Processing dataset...")
+    motion_data, labels, _ = process_dataset(args.data_dir, config)
     
-    # Train model
-    print("Training MotionBERT model...")
+    # Update config with data-dependent values
+    input_dim = motion_data.shape[-1]
+    num_classes = len(np.unique(labels))
+    
+    # Get model config
+    model_config = create_motion_bert_config(input_dim, num_classes)
+    model_config.update(config)  # Merge with training config
+    
+    # Create and train model
+    print("Training model...")
+    model = MotionBERTClassifier(model_config)
+    train_loader, val_loader = create_data_loaders(motion_data, labels, args.batch_size)
     model, history = train_motion_bert(model, train_loader, val_loader, model_config)
     
-    # Plot training history
-    plot_training_history(history, CONFIG)
+    # Save training history
+    np.save(os.path.join(args.output_dir, "training_history.npy"), history)
     
-    # Save model
-    torch.save(model.state_dict(), os.path.join(CONFIG["output_dir"], "motion_bert_model.pth"))
-    
-    print("Done!")
+    print("Training completed!")
 
 
 if __name__ == "__main__":
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Emotion Recognition from Motion Data Pipeline')
-    parser.add_argument('--data_dir', type=str, default='./test_data',
-                        help='Directory containing BVH files')
-    parser.add_argument('--output_dir', type=str, default='./output',
-                        help='Directory to save outputs')
-    parser.add_argument('--epochs', type=int, default=50,
-                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help='Batch size for training')
-    
-    args = parser.parse_args()
-    
-    # Update CONFIG with command line arguments
-    CONFIG["data_dir"] = args.data_dir
-    CONFIG["output_dir"] = args.output_dir
-    CONFIG["epochs"] = args.epochs
-    CONFIG["batch_size"] = args.batch_size
-    
     main() 
