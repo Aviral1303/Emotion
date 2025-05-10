@@ -15,7 +15,7 @@ import random
 import argparse
 
 # Source and destination directories
-SOURCE_DIR = './data/BVH'
+SOURCE_DIR = './data'
 DEST_DIR = './test_data'
 
 def extract_test_bvh_files(samples_per_emotion):
@@ -29,16 +29,19 @@ def extract_test_bvh_files(samples_per_emotion):
     os.makedirs(DEST_DIR, exist_ok=True)
     
     # Clean existing files
-    for file in os.listdir(DEST_DIR):
-        file_path = os.path.join(DEST_DIR, file)
-        if os.path.isfile(file_path):
-            os.remove(file_path)
+    if os.path.exists(DEST_DIR):
+        for file in os.listdir(DEST_DIR):
+            file_path = os.path.join(DEST_DIR, file)
+            if os.path.isfile(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
     
-    # Get list of all actor directories
-    actor_dirs = [d for d in os.listdir(SOURCE_DIR) 
-                  if os.path.isdir(os.path.join(SOURCE_DIR, d))]
+    # Get list of all BVH files
+    bvh_files = glob.glob(os.path.join(SOURCE_DIR, '*.bvh'))
     
-    print(f"Found {len(actor_dirs)} actor directories")
+    print(f"Found {len(bvh_files)} BVH files")
     
     # Dictionary to track files by emotion
     emotion_files = {
@@ -52,20 +55,16 @@ def extract_test_bvh_files(samples_per_emotion):
     }
     
     # Find files for each emotion
-    for actor in actor_dirs:
-        actor_dir = os.path.join(SOURCE_DIR, actor)
-        bvh_files = glob.glob(os.path.join(actor_dir, '*.bvh'))
-        
-        for bvh_file in bvh_files:
-            filename = os.path.basename(bvh_file)
-            # Extract emotion code from filename (e.g., F01A0V1.bvh -> A)
-            if filename[3:5] in ['SA', 'SU']:
-                emotion_code = filename[3:5]
-            else:
-                emotion_code = filename[3]
-                
-            if emotion_code in emotion_files:
-                emotion_files[emotion_code].append(bvh_file)
+    for bvh_file in bvh_files:
+        filename = os.path.basename(bvh_file)
+        # Extract emotion code from filename (e.g., F01A0V1.bvh -> A)
+        if filename[3:5] in ['SA', 'SU']:
+            emotion_code = filename[3:5]
+        else:
+            emotion_code = filename[3]
+            
+        if emotion_code in emotion_files:
+            emotion_files[emotion_code].append(bvh_file)
     
     # Sample files from each emotion
     selected_files = []
