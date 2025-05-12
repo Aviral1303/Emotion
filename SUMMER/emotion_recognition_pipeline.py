@@ -187,14 +187,14 @@ def parse_filename(filename: str) -> Dict:
 
 def parse_bvh_file(filepath: str, selected_joints: Optional[List[str]] = None) -> np.ndarray:
     """
-    Parse a BVH file and extract joint positions over time.
+    Parse a BVH file and extract joint positions and rotations over time.
     
     Args:
         filepath: Path to the BVH file
         selected_joints: Optional list of joint names to include (if None, use all)
         
     Returns:
-        Array of shape [timesteps, num_joints*3] containing joint positions
+        Array of shape [timesteps, num_joints*6] containing joint positions and rotations
     """
     with open(filepath) as f:
         mocap = bvh.Bvh(f.read())
@@ -202,33 +202,36 @@ def parse_bvh_file(filepath: str, selected_joints: Optional[List[str]] = None) -
     # Get number of frames and joints
     num_frames = mocap.nframes
     joints = list(mocap.get_joints())
+    
+    # Filter joints if specified
+    if selected_joints:
+        joints = [j for j in joints if j in selected_joints]
+    
     num_joints = len(joints)
     
-    # Initialize the array for positions
-    positions = np.zeros((num_frames, num_joints, 3))
+    # Initialize the array for positions and rotations
+    features = np.zeros((num_frames, num_joints, 6))  # 3 for position, 3 for rotation
     
-    # Extract joint positions for each frame
+    # Extract joint positions and rotations for each frame
     for frame_idx in range(num_frames):
         for joint_idx, joint in enumerate(joints):
-            # Get the joint position for this frame
             try:
-                x, y, z = mocap.frame_joint_position(frame_idx, joint)
-                positions[frame_idx, joint_idx] = [x, y, z]
-            except:
-                # Some joints might not have positions
-                positions[frame_idx, joint_idx] = [0, 0, 0]
+                # Get both position and rotation channels
+                x, y, z = mocap.frame_joint_channels(frame_idx, joint, ['Xposition', 'Yposition', 'Zposition'])
+                rx, ry, rz = mocap.frame_joint_channels(frame_idx, joint, ['Xrotation', 'Yrotation', 'Zrotation'])
+                features[frame_idx, joint_idx] = [x, y, z, rx, ry, rz]
+            except Exception as e:
+                # Use previous frame's values if available, otherwise use zeros
+                if frame_idx > 0:
+                    features[frame_idx, joint_idx] = features[frame_idx-1, joint_idx]
+                else:
+                    features[frame_idx, joint_idx] = [0, 0, 0, 0, 0, 0]
     
-    # If selected joints are specified, filter the data
-    if selected_joints:
-        joint_indices = [joints.index(joint) for joint in selected_joints 
-                         if joint in joints]
-        positions = positions[:, joint_indices, :]
+    # Reshape to [timesteps, num_joints*6]
+    num_frames, num_joints, dims = features.shape
+    features_flat = features.reshape(num_frames, num_joints * dims)
     
-    # Reshape to [timesteps, num_joints*3]
-    num_frames, num_joints, dims = positions.shape
-    positions_flat = positions.reshape(num_frames, num_joints * dims)
-    
-    return positions_flat
+    return features_flat
 
 
 def normalize_motion_data(motion_data: np.ndarray) -> np.ndarray:
