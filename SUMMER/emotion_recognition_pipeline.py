@@ -371,6 +371,26 @@ class EmotionMotionDataset(Dataset):
         return self.y.numpy()
 
 
+def create_data_loaders(X, y, batch_size, val_size=0.2, random_state=42):
+    """
+    Split data into train/val sets and return DataLoaders.
+    """
+    # Convert labels to long tensor
+    y = torch.LongTensor(y)
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=val_size, random_state=random_state, stratify=y
+    )
+    
+    train_dataset = EmotionMotionDataset(X_train, y_train)
+    val_dataset = EmotionMotionDataset(X_val, y_val)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, val_loader
+
+
 class MLPClassifier(nn.Module):
     """
     Simple MLP classifier for emotion recognition.
@@ -1022,144 +1042,126 @@ def extract_acceleration_features(positions: np.ndarray) -> np.ndarray:
     return acceleration
 
 
+def enhance_motion_features(motion_data: np.ndarray) -> np.ndarray:
+    """
+    Enhance motion data with derived features.
+    
+    Args:
+        motion_data: Array of shape [timesteps, num_joints*3]
+        
+    Returns:
+        Enhanced features with additional velocity and acceleration
+    """
+    velocity = extract_velocity_features(motion_data)
+    acceleration = extract_acceleration_features(motion_data)
+    
+    # Scale to balance magnitude differences
+    v_scale = 0.5
+    a_scale = 0.25
+    
+    # Concatenate features along feature dimension
+    enhanced = np.concatenate([
+        motion_data, 
+        velocity * v_scale, 
+        acceleration * a_scale
+    ], axis=1)
+    
+    return enhanced
+
+
 def main():
-    """Main function to run the emotion recognition pipeline."""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Run emotion recognition pipeline')
-    parser.add_argument('--config', type=str, help='Path to configuration file')
-    parser.add_argument('--data_dir', type=str, default='./test_data',
-                      help='Directory containing BVH files')
-    parser.add_argument('--output_dir', type=str, default='./output',
-                      help='Directory for output files')
-    parser.add_argument('--epochs', type=int, default=100,
-                      help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
-                      help='Training batch size')
-    args = parser.parse_args()
+    """Main function to run the entire pipeline."""
+    # Setup directories
+    os.makedirs(CONFIG["data_dir"], exist_ok=True)
+    os.makedirs(CONFIG["output_dir"], exist_ok=True)
     
-    # Load configuration
-    if args.config and os.path.exists(args.config):
-        with open(args.config, 'r') as f:
-            config = json.load(f)
-            # Ensure all required parameters are present
-            for key, value in CONFIG.items():
-                if key not in config:
-                    config[key] = value
-    else:
-        # Use default configuration
-        config = CONFIG.copy()
-        config.update({
-            'data_dir': args.data_dir,
-            'output_dir': args.output_dir,
-            'epochs': args.epochs,
-            'batch_size': args.batch_size
-        })
+    if not os.path.exists(CONFIG["data_dir"]):
+        print(f"Data directory {CONFIG['data_dir']} not found.")
+        return
     
-    # Create output directory
-    os.makedirs(config['output_dir'], exist_ok=True)
+    print("Processing dataset...")
+    X, y, metadata_df = process_dataset(CONFIG["data_dir"], CONFIG)
     
-    # Set random seeds for reproducibility
-    torch.manual_seed(config['seed'])
-    np.random.seed(config['seed'])
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(config['seed'])
+    # Save processed data
+    print("Saving processed data...")
+    np.save(os.path.join(CONFIG["output_dir"], "X.npy"), X)
+    np.save(os.path.join(CONFIG["output_dir"], "y.npy"), y)
+    metadata_df.to_csv(os.path.join(CONFIG["output_dir"], "metadata.csv"), index=False)
     
-    # Process dataset
-    X, y, metadata_df = process_dataset(config['data_dir'], config)
-    
-    # Split dataset
+    # Split data
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=config['test_size'], 
-        stratify=y, random_state=config['seed']
+        X, y, test_size=CONFIG["test_size"], random_state=CONFIG["seed"], stratify=y
     )
     
     X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train, 
-        test_size=config['validation_size'],
-        stratify=y_train, 
-        random_state=config['seed']
+        X_train, y_train, test_size=CONFIG["validation_size"]/(1-CONFIG["test_size"]),
+        random_state=CONFIG["seed"], stratify=y_train
     )
     
-    # Create data loaders
+    print(f"Training set: {X_train.shape[0]} samples")
+    print(f"Validation set: {X_val.shape[0]} samples")
+    print(f"Test set: {X_test.shape[0]} samples")
+    
+    # Create datasets and dataloaders
     train_dataset = EmotionMotionDataset(X_train, y_train)
     val_dataset = EmotionMotionDataset(X_val, y_val)
     test_dataset = EmotionMotionDataset(X_test, y_test)
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=4
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"])
+    test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"])
+    
+    # Create MotionBERT model
+    print("Creating MotionBERT model...")
+    model_config = create_motion_bert_config(
+        input_dim=X_train.shape[2],  # features
+        num_classes=len(EMOTION_MAP)
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=4
-    )
+    # Update model config with training parameters
+    model_config.update({
+        "learning_rate": CONFIG["learning_rate"],
+        "weight_decay": CONFIG["weight_decay"],
+        "epochs": CONFIG["epochs"],
+        "early_stopping_patience": CONFIG["early_stopping_patience"],
+        "warmup_steps": CONFIG["warmup_steps"],
+        "max_steps": CONFIG["max_steps"],
+        "gradient_clip_val": CONFIG["gradient_clip_val"]
+    })
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=4
-    )
-    
-    # Create model
-    model = MotionBERTClassifier(config)
-    
-    # Use GPU if available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
+    model = MotionBERTClassifier(model_config)
     
     # Train model
-    model, history = train_motion_bert(
-        model,
-        train_loader,
-        val_loader,
-        config
-    )
-    
-    # Evaluate on test set
-    model.eval()
-    test_correct = 0
-    test_total = 0
-    
-    with torch.no_grad():
-        for inputs, labels in test_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs.data, 1)
-            test_total += labels.size(0)
-            test_correct += (predicted == labels).sum().item()
-    
-    test_acc = 100 * test_correct / test_total
-    
-    # Save results
-    results = {
-        'train_acc': history['train_acc'][-1],
-        'val_acc': history['val_acc'][-1],
-        'test_acc': test_acc,
-        'best_epoch': history['best_epoch']
-    }
-    
-    with open(os.path.join(config['output_dir'], 'results.json'), 'w') as f:
-        json.dump(results, f)
+    print("Training MotionBERT model...")
+    model, history = train_motion_bert(model, train_loader, val_loader, model_config)
     
     # Plot training history
-    plot_training_history(history, config)
+    plot_training_history(history, CONFIG)
     
     # Save model
-    torch.save(model.state_dict(), os.path.join(config['output_dir'], 'model.pth'))
+    torch.save(model.state_dict(), os.path.join(CONFIG["output_dir"], "motion_bert_model.pth"))
     
-    print("\nTraining completed!")
-    print(f"Final Training Accuracy: {results['train_acc']:.2f}%")
-    print(f"Final Validation Accuracy: {results['val_acc']:.2f}%")
-    print(f"Test Accuracy: {results['test_acc']:.2f}%")
-    print(f"Best Epoch: {results['best_epoch']}")
+    print("Done!")
 
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Emotion Recognition from Motion Data Pipeline')
+    parser.add_argument('--data_dir', type=str, default='./test_data',
+                        help='Directory containing BVH files')
+    parser.add_argument('--output_dir', type=str, default='./output',
+                        help='Directory to save outputs')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=16,
+                        help='Batch size for training')
+    
+    args = parser.parse_args()
+    
+    # Update CONFIG with command line arguments
+    CONFIG["data_dir"] = args.data_dir
+    CONFIG["output_dir"] = args.output_dir
+    CONFIG["epochs"] = args.epochs
+    CONFIG["batch_size"] = args.batch_size
+    
     main() 
