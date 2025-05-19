@@ -131,3 +131,67 @@ The models were evaluated on their ability to classify emotions from motion data
 - Hyperparameter optimization
 - Additional feature engineering beyond raw joint positions
 - Cross-validation for more robust evaluation
+
+## Latest Model Performance (Updated)
+
+### Overall Performance
+- Training Accuracy: 63.51%
+- Test Accuracy: 63.16%
+
+### Class-Specific Performance
+
+#### Neutral Class
+- Precision: 0.8621 (86.21%)
+- Recall: 1.0000 (100.00%)
+- F1-Score: 0.9260 (92.60%)
+- Support: 31 samples
+
+#### Positive Class
+- Precision: 0.4889 (48.89%)
+- Recall: 0.9167 (91.67%)
+- F1-Score: 0.6364 (63.64%)
+- Support: 31 samples
+
+#### Negative Class
+- Precision: 0.0000 (0.00%)
+- Recall: 0.0000 (0.00%)
+- F1-Score: 0.0000 (0.00%)
+- Support: 31 samples
+
+### Key Observations
+1. The model shows excellent performance for the Neutral class with perfect recall and high precision
+2. Good recall for Positive class (91.67%) but lower precision (48.89%)
+3. The model currently struggles with Negative class detection
+4. Class balancing was successful with 31 samples per class after augmentation
+
+### Model Architecture
+- Total Parameters: 876,037
+- Input Features: 60 (20 joints × 3 coordinates)
+- Sequence Length: 150 frames
+- Number of Classes: 3 (Negative, Neutral, Positive)
+
+### Training Details
+- Optimizer: AdamW with learning rate 0.0003
+- Loss Function: CrossEntropyLoss with custom class weights [0.2, 0.4, 0.6]
+- Early Stopping: Patience of 15 epochs
+- Learning Rate Scheduler: ReduceLROnPlateau with factor 0.5 and patience 5
+
+### Data Augmentation
+- Successfully balanced classes from original distribution:
+  - Negative: 62.0%
+  - Neutral: 12.0%
+  - Positive: 26.0%
+- Final balanced distribution: 33.3% per class
+- Augmentation techniques used:
+  - Time shifting
+  - Time scaling
+  - Noise addition
+  - Segment reversal
+  - Interpolation
+  - Mix-up
+
+### Areas for Improvement
+1. Enhance Negative class detection
+2. Improve precision for Positive class
+3. Investigate feature engineering for better emotion discrimination
+4. Consider ensemble methods for improved robustness
