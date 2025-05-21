@@ -212,4 +212,10 @@ SUMMER/test_data/
 SUMMER/test_output/
 SUMMER/kinematic-dataset-of-actors-expressing-emotions*
 SUMMER/**/*.bvh
+SUMMER/new_dataset_test_BOLD/
+# BOLD dataset files and directories
+**/BOLD_public/
+**/*BOLD*/videos/
+**/*BOLD*/joints/
+**/*BOLD*/annotations/
 # Add any other dataset file patterns specific to your project 
