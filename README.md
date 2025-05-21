@@ -135,48 +135,56 @@ The models were evaluated on their ability to classify emotions from motion data
 ## Latest Model Performance (Updated)
 
 ### Overall Performance
+
 - Training Accuracy: 63.51%
 - Test Accuracy: 63.16%
 
 ### Class-Specific Performance
 
 #### Neutral Class
+
 - Precision: 0.8621 (86.21%)
 - Recall: 1.0000 (100.00%)
 - F1-Score: 0.9260 (92.60%)
 - Support: 31 samples
 
 #### Positive Class
+
 - Precision: 0.4889 (48.89%)
 - Recall: 0.9167 (91.67%)
 - F1-Score: 0.6364 (63.64%)
 - Support: 31 samples
 
 #### Negative Class
+
 - Precision: 0.0000 (0.00%)
 - Recall: 0.0000 (0.00%)
 - F1-Score: 0.0000 (0.00%)
 - Support: 31 samples
 
 ### Key Observations
+
 1. The model shows excellent performance for the Neutral class with perfect recall and high precision
 2. Good recall for Positive class (91.67%) but lower precision (48.89%)
 3. The model currently struggles with Negative class detection
 4. Class balancing was successful with 31 samples per class after augmentation
 
 ### Model Architecture
+
 - Total Parameters: 876,037
 - Input Features: 60 (20 joints × 3 coordinates)
 - Sequence Length: 150 frames
 - Number of Classes: 3 (Negative, Neutral, Positive)
 
 ### Training Details
+
 - Optimizer: AdamW with learning rate 0.0003
 - Loss Function: CrossEntropyLoss with custom class weights [0.2, 0.4, 0.6]
 - Early Stopping: Patience of 15 epochs
 - Learning Rate Scheduler: ReduceLROnPlateau with factor 0.5 and patience 5
 
 ### Data Augmentation
+
 - Successfully balanced classes from original distribution:
   - Negative: 62.0%
   - Neutral: 12.0%
@@ -191,7 +199,104 @@ The models were evaluated on their ability to classify emotions from motion data
   - Mix-up
 
 ### Areas for Improvement
+
 1. Enhance Negative class detection
 2. Improve precision for Positive class
 3. Investigate feature engineering for better emotion discrimination
 4. Consider ensemble methods for improved robustness
+
+## BOLD Dataset Integration
+
+### BOLD Dataset Overview
+
+The project now incorporates the [BOLD (Bodily Expressed Language Dataset)](https://cydar.ist.psu.edu/emotionchallenge/index.html), which contains human motion data with emotion annotations.
+
+Key features:
+
+- Video recordings of people expressing emotions through body movement
+- 26 emotion categories grouped into positive/negative/neutral classes
+- 2D skeletal joint positions extracted using pose estimation
+- Annotations for multiple people in each video
+
+### BOLD Transformer Model
+
+`SUMMER/bold_transformer_model.py` implements a specialized transformer model for the BOLD dataset:
+
+- **Architecture**: Attention-based transformer for capturing spatial-temporal relationships
+
+  - Feature projection layer (54 → 128 dimensions)
+  - Positional encoding for sequence awareness
+  - 3-layer transformer encoder with 8 attention heads
+  - Global pooling and classification layers
+
+- **Data Processing**:
+
+  - Conversion of 26 emotion categories to binary classification (Positive/Negative)
+  - Flexible frame selection to accommodate missing data
+  - Person-specific joint data extraction
+  - Sequence length standardization (150 frames)
+  - Normalization of joint positions
+
+- **Training Details**:
+
+  - AdamW optimizer with weight decay
+  - Class-weighted loss function to handle imbalanced classes
+  - Early stopping to prevent overfitting
+  - Learning rate scheduling
+
+- **Performance on BOLD Dataset**:
+  - Training Accuracy: 61.90%
+  - Validation Accuracy: 53.85%
+  - Class distribution heavily skewed (90.5% Positive, 9.5% Negative)
+  - Precision and recall tradeoffs observed in the confusion matrix
+
+### Key Challenges and Solutions
+
+1. **Data Availability**:
+
+   - Many joint files were missing or had different structures
+   - Solution: Implemented flexible frame selection that tries multiple possible frame indices
+
+2. **Person Identification**:
+
+   - Multiple people in each scene with different person IDs
+   - Solution: Person-specific data extraction with fallback to first available person
+
+3. **Class Imbalance**:
+
+   - Highly skewed distribution (predominantly positive emotions)
+   - Solution: Class weighting in loss function
+
+4. **Model Serialization**:
+   - PyTorch 2.6 introduced stricter serialization requirements
+   - Solution: Added safe globals and modified serialization approach
+
+### Future Work with BOLD Dataset
+
+- Additional preprocessing to handle missing data
+- Exploration of multi-class emotion recognition beyond binary classification
+- Cross-dataset training between PhysioNet and BOLD datasets
+- Ensemble methods combining different model architectures
+
+The BOLD dataset integration demonstrates the framework's adaptability to different motion data formats and emotion classification tasks.
+
+### BOLD Transformer Model Tools
+
+- **Evaluation Script**: `SUMMER/bold_evaluate_model.py`
+
+  - Loads the trained model
+  - Supports evaluation on test data
+  - Generates confusion matrices and classification reports
+  - Handles PyTorch 2.6 serialization requirements
+
+- **Version Control**:
+  - Added BOLD dataset patterns to `.gitignore`
+  - Excluded dataset directories and large binary files
+  - Ensured model weights are preserved while excluding raw data
+
+### Running the BOLD Model
+
+1. Ensure the BOLD dataset is downloaded to `SUMMER/new_dataset_test_BOLD/BOLD_public/`
+2. Activate the virtual environment: `source SUMMER/venv/bin/activate`
+3. Run the model: `python SUMMER/bold_transformer_model.py`
+4. Evaluate the model: `python SUMMER/bold_evaluate_model.py`
